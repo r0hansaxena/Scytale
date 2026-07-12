@@ -1,0 +1,14 @@
+name: scytale_agent
+description: Personal AI Agent for the Scytale app (Atsign Platform)
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  at_cli_commons: ^1.2.0
+  at_client: ^3.12.0
+  at_commons: ^5.2.0
+  at_utils: ^3.0.19
+  http: ^1.2.0
