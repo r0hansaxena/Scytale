@@ -2,6 +2,7 @@ import 'package:at_client/at_client.dart';
 import 'package:flutter/material.dart';
 
 import '../core/constants.dart';
+import '../models/models.dart';
 import '../services/message_service.dart';
 import '../services/profile_service.dart';
 import 'agent_screen.dart';
@@ -33,6 +34,14 @@ class _InboxScreenState extends State<InboxScreen> {
     for (final peer in _messages.conversations.keys) {
       _profiles.fetch(peer);
     }
+  }
+
+  String _previewText(ChatMessage m) {
+    if (m.deleted) return 'Message deleted';
+    if (m.kind == 'image') return '📷 Photo';
+    if (m.kind == 'file') return '📎 ${m.fileName ?? 'File'}';
+    if (m.kind == 'call') return '📹 ${m.text}';
+    return m.text;
   }
 
   Future<void> _newChat() async {
@@ -160,7 +169,7 @@ class _InboxScreenState extends State<InboxScreen> {
                 subtitle: last == null
                     ? const Text('No messages yet')
                     : Text(
-                        last.deleted ? 'Message deleted' : last.text,
+                        _previewText(last),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),

@@ -83,6 +83,7 @@ class MessageService extends ChangeNotifier {
     conversations.clear();
     statuses.clear();
     favorites.clear();
+    _attachmentCache.clear();
 
     await _loadLocalHistory();
 
@@ -109,6 +110,7 @@ class MessageService extends ChangeNotifier {
     conversations.clear();
     statuses.clear();
     favorites.clear();
+    _attachmentCache.clear();
   }
 
   bool get isStarted => _started;
@@ -192,6 +194,113 @@ class MessageService extends ChangeNotifier {
 
   DeliveryStatus statusOf(String msgId) =>
       statuses[msgId] ?? DeliveryStatus.stored;
+
+  // ---------------------------------------------------------------------
+  // Attachments (images / files)
+  //
+  // Bytes are base64'd into a separate `file.<id>` key (written straight to
+  // the cloud so the peer can fetch it immediately); the `msg.<id>` message
+  // carries only lightweight metadata and drives the bubble. atServer value
+  // size limits mean this suits images/docs/short clips, not large videos.
+  // ---------------------------------------------------------------------
+
+  static const int maxAttachmentBytes = 1500 * 1024; // ~1.5 MB
+
+  final Map<String, Uint8List> _attachmentCache = {};
+
+  /// Sends [bytes] as an attachment. Returns null on success, or an
+  /// error message (e.g. too large) to show the user.
+  Future<String?> sendAttachment(
+      String peerRaw, Uint8List bytes, String fileName, String mime) async {
+    if (bytes.length > maxAttachmentBytes) {
+      return 'File is too large (${formatSize(bytes.length)}). '
+          'Attachments are limited to ${formatSize(maxAttachmentBytes)}.';
+    }
+    final peer = peerRaw.toAtsign();
+    final id = _uuid.v4();
+    final kind = mime.startsWith('image/') ? 'image' : 'file';
+    final msg = ChatMessage(
+      id: id,
+      from: me,
+      to: peer,
+      text: fileName,
+      ts: DateTime.now().millisecondsSinceEpoch,
+      kind: kind,
+      fileName: fileName,
+      mime: mime,
+      fileSize: bytes.length,
+    );
+    _attachmentCache[id] = bytes;
+    _conversation(peer).messagesById[id] = msg;
+    statuses[id] = DeliveryStatus.sending;
+    notifyListeners();
+
+    // 1. Store the bytes on the cloud secondary so the peer can fetch them
+    //    the moment the metadata message wakes them.
+    var bytesStored = false;
+    try {
+      await _atClient.put(
+        _sharedKey('file.$id', peer),
+        base64Encode(bytes),
+        putRequestOptions: PutRequestOptions()..useRemoteAtServer = true,
+      );
+      bytesStored = true;
+    } on AtClientException catch (e) {
+      debugPrint('attachment bytes put failed: $e');
+    }
+    if (!bytesStored) {
+      statuses[id] = DeliveryStatus.failed;
+      notifyListeners();
+      return 'Failed to upload the attachment. Check your connection.';
+    }
+
+    // 2. Store + notify the metadata message (drives the bubble + inbox).
+    final metaStored = await _putAndNotify(
+      _sharedKey('msg.$id', peer),
+      jsonEncode(msg.toJson()),
+      onDelivery: (delivered) {
+        if (delivered) statuses[id] = DeliveryStatus.delivered;
+        notifyListeners();
+      },
+    );
+    if (statuses[id] == DeliveryStatus.sending) {
+      statuses[id] = metaStored ? DeliveryStatus.stored : DeliveryStatus.failed;
+    }
+    notifyListeners();
+    return null;
+  }
+
+  /// Lazily fetch (and cache) the bytes for an attachment message.
+  Future<Uint8List?> loadAttachment(ChatMessage msg) async {
+    final cached = _attachmentCache[msg.id];
+    if (cached != null) return cached;
+    try {
+      final AtKey key;
+      if (msg.from == me) {
+        key = _sharedKey('file.${msg.id}', msg.to);
+      } else {
+        key = AtKey()
+          ..key = 'file.${msg.id}'
+          ..namespace = appNamespace
+          ..sharedBy = msg.from.toAtsign()
+          ..sharedWith = me;
+      }
+      final res = await _atClient.get(key);
+      if (res.value == null) return null;
+      final bytes = base64Decode(res.value as String);
+      _attachmentCache[msg.id] = bytes;
+      return bytes;
+    } catch (e) {
+      debugPrint('loadAttachment failed for ${msg.id}: $e');
+      return null;
+    }
+  }
+
+  static String formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
 
   Future<void> _updateOwnMessage(ChatMessage updated) async {
     final peer = updated.to;

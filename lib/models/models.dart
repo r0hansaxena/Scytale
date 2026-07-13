@@ -31,7 +31,12 @@ class ChatMessage {
   final String? replyTo; // id of the message this replies to
   final bool edited;
   final bool deleted; // tombstone: history slot preserved, content removed
-  final String kind; // 'text' | 'call' (call-history entry)
+  final String kind; // 'text' | 'call' | 'image' | 'file'
+  // Attachment metadata (kind == 'image' | 'file'). The bytes live in a
+  // separate `file.<id>` key, fetched lazily; only the metadata rides here.
+  final String? fileName;
+  final String? mime;
+  final int? fileSize;
 
   const ChatMessage({
     required this.id,
@@ -43,9 +48,13 @@ class ChatMessage {
     this.edited = false,
     this.deleted = false,
     this.kind = 'text',
+    this.fileName,
+    this.mime,
+    this.fileSize,
   });
 
   bool get isCallEntry => kind == 'call';
+  bool get isAttachment => kind == 'image' || kind == 'file';
 
   ChatMessage copyWith({String? text, bool? edited, bool? deleted}) =>
       ChatMessage(
@@ -58,6 +67,9 @@ class ChatMessage {
         edited: edited ?? this.edited,
         deleted: deleted ?? this.deleted,
         kind: kind,
+        fileName: fileName,
+        mime: mime,
+        fileSize: fileSize,
       );
 
   Map<String, dynamic> toJson() => {
@@ -70,6 +82,9 @@ class ChatMessage {
         'edited': edited,
         'deleted': deleted,
         if (kind != 'text') 'kind': kind,
+        if (fileName != null) 'fileName': fileName,
+        if (mime != null) 'mime': mime,
+        if (fileSize != null) 'fileSize': fileSize,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -82,6 +97,9 @@ class ChatMessage {
         edited: json['edited'] as bool? ?? false,
         deleted: json['deleted'] as bool? ?? false,
         kind: json['kind'] as String? ?? 'text',
+        fileName: json['fileName'] as String?,
+        mime: json['mime'] as String?,
+        fileSize: json['fileSize'] as int?,
       );
 }
 

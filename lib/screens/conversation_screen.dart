@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:at_client/at_client.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -68,6 +71,44 @@ class _ConversationScreenState extends State<ConversationScreen> {
       await _messages.editMessage(widget.peer, editing.id, text);
     } else {
       await _messages.sendMessage(widget.peer, text, replyTo: replyingTo?.id);
+    }
+  }
+
+  Future<void> _attachFile() async {
+    final result = await FilePicker.pickFiles(withData: true);
+    if (result == null || result.files.isEmpty) return;
+    final f = result.files.single;
+    final bytes = f.bytes;
+    if (bytes == null) return;
+    final error = await _messages.sendAttachment(
+        widget.peer, bytes, f.name, _guessMime(f.extension));
+    if (error != null && mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error)));
+    }
+  }
+
+  static String _guessMime(String? ext) {
+    switch (ext?.toLowerCase()) {
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      case 'png':
+        return 'image/png';
+      case 'gif':
+        return 'image/gif';
+      case 'webp':
+        return 'image/webp';
+      case 'bmp':
+        return 'image/bmp';
+      case 'pdf':
+        return 'application/pdf';
+      case 'mp4':
+        return 'video/mp4';
+      case 'mp3':
+        return 'audio/mpeg';
+      default:
+        return 'application/octet-stream';
     }
   }
 
@@ -185,6 +226,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
                       if (msg.isCallEntry) {
                         return _CallEntry(msg: msg, isMine: msg.from == _me);
                       }
+                      if (msg.isAttachment) {
+                        return _AttachmentBubble(
+                          msg: msg,
+                          isMine: msg.from == _me,
+                          onLongPress: () => _showMessageActions(msg),
+                        );
+                      }
                       return _MessageBubble(
                         msg: msg,
                         isMine: msg.from == _me,
@@ -216,6 +264,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
               padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
               child: Row(
                 children: [
+                  IconButton(
+                    onPressed: _attachFile,
+                    icon: const Icon(Icons.attach_file),
+                    tooltip: 'Attach a file',
+                  ),
+                  const SizedBox(width: 4),
                   Expanded(
                     child: TextField(
                       controller: _composer,
@@ -242,6 +296,138 @@ class _ConversationScreenState extends State<ConversationScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Image preview or file chip, with tap-to-save.
+class _AttachmentBubble extends StatelessWidget {
+  final ChatMessage msg;
+  final bool isMine;
+  final VoidCallback onLongPress;
+
+  const _AttachmentBubble({
+    required this.msg,
+    required this.isMine,
+    required this.onLongPress,
+  });
+
+  Future<void> _save(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final bytes = await MessageService.instance.loadAttachment(msg);
+    if (bytes == null) {
+      messenger.showSnackBar(
+          const SnackBar(content: Text('Could not load the file')));
+      return;
+    }
+    final path = await FilePicker.saveFile(
+      dialogTitle: 'Save file',
+      fileName: msg.fileName ?? 'file',
+    );
+    if (path == null) return;
+    try {
+      await File(path).writeAsBytes(bytes);
+      messenger.showSnackBar(SnackBar(content: Text('Saved to $path')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Save failed: $e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final bubbleColor = isMine
+        ? theme.colorScheme.primaryContainer
+        : theme.colorScheme.surfaceContainerHighest;
+    final sizeLabel =
+        msg.fileSize == null ? '' : ' · ${MessageService.formatSize(msg.fileSize!)}';
+    final timeLabel =
+        DateFormat.Hm().format(DateTime.fromMillisecondsSinceEpoch(msg.ts));
+
+    Widget content;
+    if (msg.kind == 'image') {
+      content = FutureBuilder(
+        future: MessageService.instance.loadAttachment(msg),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const SizedBox(
+              width: 200,
+              height: 140,
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          final bytes = snapshot.data;
+          if (bytes == null) {
+            return const SizedBox(
+              width: 200,
+              height: 80,
+              child: Center(child: Text('Image unavailable')),
+            );
+          }
+          return ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.memory(bytes,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => const Text('Broken image')),
+          );
+        },
+      );
+    } else {
+      content = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.insert_drive_file_outlined, size: 32),
+          const SizedBox(width: 10),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(msg.fileName ?? 'file',
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text(
+                  '${msg.fileSize == null ? '' : MessageService.formatSize(msg.fileSize!)} · tap to save',
+                  style: theme.textTheme.labelSmall,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          const Icon(Icons.download),
+        ],
+      );
+    }
+
+    return Align(
+      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 300),
+        child: GestureDetector(
+          onTap: () => _save(context),
+          onLongPress: onLongPress,
+          onSecondaryTap: onLongPress,
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            padding: EdgeInsets.all(msg.kind == 'image' ? 6 : 12),
+            decoration: BoxDecoration(
+              color: bubbleColor,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                content,
+                Padding(
+                  padding: const EdgeInsets.only(top: 4, left: 2, right: 2),
+                  child: Text('$timeLabel$sizeLabel',
+                      style: theme.textTheme.labelSmall),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
