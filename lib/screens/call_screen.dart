@@ -3,10 +3,11 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../services/call_service.dart';
 import '../services/profile_service.dart';
+import '../widgets/avatar.dart';
 
-/// In-call UI: remote video full-screen, local preview in a corner,
-/// accept/decline for incoming calls, mute/camera/hang-up controls.
-/// Pops itself when the call ends.
+/// In-call UI. Incoming calls show mic/camera pre-toggles before Accept.
+/// Connected calls show remote video (or an avatar for voice), a local
+/// preview, and mute / camera(-or-switch-to-video) / end controls.
 class CallScreen extends StatefulWidget {
   const CallScreen({super.key});
 
@@ -39,10 +40,11 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   String get _statusText => switch (_calls.state) {
-        CallState.outgoing => 'Calling…',
+        CallState.outgoing =>
+          _calls.videoCall ? 'Calling (video)…' : 'Calling…',
         CallState.incoming =>
-          _calls.audioOnly ? 'Incoming call' : 'Incoming video call',
-        CallState.connected => _calls.audioOnly ? 'Voice call' : '',
+          _calls.videoCall ? 'Incoming video call' : 'Incoming voice call',
+        CallState.connected => _calls.videoCall ? '' : 'Voice call',
         CallState.idle => 'Call ended',
       };
 
@@ -52,32 +54,29 @@ class _CallScreenState extends State<CallScreen> {
     final profile = peer.isEmpty ? null : ProfileService.instance.cached(peer);
     final displayName =
         (profile?.name.isNotEmpty ?? false) ? profile!.name : peer;
+    final showRemoteVideo = _calls.state == CallState.connected &&
+        _calls.remoteRenderer.srcObject != null &&
+        _calls.remoteCameraOn;
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Remote video (or a placeholder while ringing / audio-only).
-          if (_calls.state == CallState.connected)
+          if (showRemoteVideo)
             RTCVideoView(_calls.remoteRenderer,
                 objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
-          if (_calls.state != CallState.connected || _calls.audioOnly)
+          // Avatar placeholder when there's no remote video yet.
+          if (!showRemoteVideo)
             Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  CircleAvatar(
-                    radius: 48,
-                    child: Text(
-                      peer.length > 1 ? peer[1].toUpperCase() : '@',
-                      style: const TextStyle(fontSize: 40),
-                    ),
-                  ),
+                  Avatar(atsign: peer, profile: profile, radius: 48),
                   const SizedBox(height: 16),
                   Text(displayName,
-                      style: const TextStyle(
-                          color: Colors.white, fontSize: 22)),
+                      style:
+                          const TextStyle(color: Colors.white, fontSize: 22)),
                   const SizedBox(height: 8),
                   Text(_statusText,
                       style: const TextStyle(color: Colors.white70)),
@@ -85,8 +84,8 @@ class _CallScreenState extends State<CallScreen> {
               ),
             ),
 
-          // Local preview.
-          if (!_calls.audioOnly && _calls.state != CallState.incoming)
+          // Local preview (only when our camera is live).
+          if (_calls.showLocalVideo)
             Positioned(
               right: 16,
               top: 16,
@@ -101,8 +100,7 @@ class _CallScreenState extends State<CallScreen> {
               ),
             ),
 
-          // Peer name overlay during connected video call.
-          if (_calls.state == CallState.connected && !_calls.audioOnly)
+          if (showRemoteVideo)
             Positioned(
               left: 16,
               top: 16,
@@ -123,53 +121,91 @@ class _CallScreenState extends State<CallScreen> {
             left: 0,
             right: 0,
             bottom: 32,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: _calls.state == CallState.incoming
-                  ? [
-                      _RoundButton(
-                        color: Colors.green,
-                        icon: Icons.call,
-                        label: 'Accept',
-                        onTap: () => _calls.accept(),
-                      ),
-                      const SizedBox(width: 48),
-                      _RoundButton(
-                        color: Colors.red,
-                        icon: Icons.call_end,
-                        label: 'Decline',
-                        onTap: () => _calls.decline(),
-                      ),
-                    ]
-                  : [
-                      _RoundButton(
-                        color: Colors.white24,
-                        icon: _calls.muted ? Icons.mic_off : Icons.mic,
-                        label: _calls.muted ? 'Unmute' : 'Mute',
-                        onTap: _calls.toggleMute,
-                      ),
-                      const SizedBox(width: 24),
-                      if (!_calls.audioOnly)
-                        _RoundButton(
-                          color: Colors.white24,
-                          icon: _calls.cameraOff
-                              ? Icons.videocam_off
-                              : Icons.videocam,
-                          label: _calls.cameraOff ? 'Camera on' : 'Camera off',
-                          onTap: _calls.toggleCamera,
-                        ),
-                      if (!_calls.audioOnly) const SizedBox(width: 24),
-                      _RoundButton(
-                        color: Colors.red,
-                        icon: Icons.call_end,
-                        label: 'End',
-                        onTap: () => _calls.hangup(),
-                      ),
-                    ],
-            ),
+            child: _calls.state == CallState.incoming
+                ? _incomingControls()
+                : _connectedControls(),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _incomingControls() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Pre-answer mic/camera choices.
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _RoundButton(
+              color: _calls.pendingMicOn ? Colors.white24 : Colors.red,
+              icon: _calls.pendingMicOn ? Icons.mic : Icons.mic_off,
+              label: _calls.pendingMicOn ? 'Mic on' : 'Mic off',
+              onTap: _calls.togglePendingMic,
+            ),
+            const SizedBox(width: 24),
+            _RoundButton(
+              color: _calls.pendingCamOn ? Colors.white24 : Colors.red,
+              icon: _calls.pendingCamOn ? Icons.videocam : Icons.videocam_off,
+              label: _calls.pendingCamOn ? 'Camera on' : 'Camera off',
+              onTap: _calls.togglePendingCam,
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _RoundButton(
+              color: Colors.green,
+              icon: Icons.call,
+              label: 'Accept',
+              onTap: () => _calls.accept(),
+            ),
+            const SizedBox(width: 48),
+            _RoundButton(
+              color: Colors.red,
+              icon: Icons.call_end,
+              label: 'Decline',
+              onTap: () => _calls.decline(),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _connectedControls() {
+    final hasCamera = _calls.showLocalVideo;
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        _RoundButton(
+          color: Colors.white24,
+          icon: _calls.muted ? Icons.mic_off : Icons.mic,
+          label: _calls.muted ? 'Unmute' : 'Mute',
+          onTap: _calls.toggleMute,
+        ),
+        const SizedBox(width: 24),
+        _RoundButton(
+          color: Colors.white24,
+          icon: hasCamera ? Icons.videocam : Icons.videocam_off,
+          // No camera track yet → this starts video (upgrade). Otherwise it
+          // toggles the existing camera.
+          label: hasCamera
+              ? 'Camera off'
+              : (_calls.videoCall ? 'Camera on' : 'Start video'),
+          onTap: _calls.toggleCamera,
+        ),
+        const SizedBox(width: 24),
+        _RoundButton(
+          color: Colors.red,
+          icon: Icons.call_end,
+          label: 'End',
+          onTap: () => _calls.hangup(),
+        ),
+      ],
     );
   }
 }
