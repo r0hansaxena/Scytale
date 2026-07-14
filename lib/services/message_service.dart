@@ -35,16 +35,23 @@ import '../models/models.dart';
 
 const _uuid = Uuid();
 
-/// Per-peer conversation state held in memory for the UI.
+/// Per-conversation state held in memory for the UI. [peer] is the other
+/// Atsign for a 1:1 chat, or the group id for a group chat.
 class ConversationState {
   final String peer;
+  final bool isGroup;
+  String displayName;
+  List<String> members; // group members (empty for 1:1)
   final Map<String, ChatMessage> messagesById = {};
   /// msgId -> (`<emojiId>:<by>` -> Reaction), removed reactions excluded.
   final Map<String, Map<String, Reaction>> reactions = {};
   int peerLastReadTs = 0; // how far the peer has read our messages
   int myLastReadTs = 0; // how far we have read theirs
 
-  ConversationState(this.peer);
+  ConversationState(this.peer,
+      {this.isGroup = false, String? displayName, List<String>? members})
+      : displayName = displayName ?? peer,
+        members = members ?? const [];
 
   List<ChatMessage> get sortedMessages =>
       messagesById.values.toList()..sort((a, b) => a.ts.compareTo(b.ts));
@@ -70,6 +77,13 @@ class MessageService extends ChangeNotifier {
   final Map<String, DeliveryStatus> statuses = {};
   final Set<String> favorites = {};
 
+  /// Peers whose conversation is archived (hidden from the main inbox).
+  /// Persisted as the self key `archived.scytale`.
+  final Set<String> archived = {};
+
+  /// Known groups by id.
+  final Map<String, Group> groups = {};
+
   StreamSubscription<AtNotification>? _subscription;
   bool _started = false;
 
@@ -83,14 +97,18 @@ class MessageService extends ChangeNotifier {
     conversations.clear();
     statuses.clear();
     favorites.clear();
+    archived.clear();
+    groups.clear();
     _attachmentCache.clear();
 
+    await _loadGroups(); // before history, so group messages route correctly
     await _loadLocalHistory();
+    await _loadArchived();
 
     _subscription?.cancel();
     _subscription = _atClient.notificationService
         .subscribe(
-            regex: '(msg|rct|read)\\..*\\.$appNamespace@',
+            regex: '(msg|rct|read|grp)\\..*\\.$appNamespace@',
             shouldDecrypt: true)
         .listen(_onNotification,
             onError: (e) => debugPrint('notification stream error: $e'));
@@ -110,10 +128,217 @@ class MessageService extends ChangeNotifier {
     conversations.clear();
     statuses.clear();
     favorites.clear();
+    archived.clear();
     _attachmentCache.clear();
   }
 
   bool get isStarted => _started;
+
+  // ---------------------------------------------------------------------
+  // Conversation management (archive / delete / read state)
+  // ---------------------------------------------------------------------
+
+  bool isArchived(String peerRaw) => archived.contains(peerRaw.toAtsign());
+
+  Future<void> toggleArchive(String peerRaw) async {
+    final peer = peerRaw.toAtsign();
+    if (!archived.remove(peer)) archived.add(peer);
+    notifyListeners();
+    await _saveArchived();
+  }
+
+  Future<void> _loadArchived() async {
+    try {
+      final value = (await _atClient.get(_selfKey('archived'))).value;
+      if (value != null) {
+        archived
+          ..clear()
+          ..addAll((jsonDecode(value) as List).map((e) => e.toString()));
+      }
+    } catch (_) {
+      // No archive list yet.
+    }
+  }
+
+  Future<void> _saveArchived() async {
+    try {
+      await _atClient.put(_selfKey('archived'), jsonEncode(archived.toList()));
+    } on AtClientException catch (e) {
+      debugPrint('failed to save archive list: $e');
+    }
+  }
+
+  /// Reset our read watermark so the conversation shows as unread.
+  Future<void> markUnread(String convId) async {
+    final conv = _convFor(convId);
+    conv.myLastReadTs = 0;
+    notifyListeners();
+    if (conv.isGroup) return;
+    final peer = convId.toAtsign();
+    try {
+      await _atClient.put(
+        _selfKey('myread.${peer.withoutAt()}'),
+        jsonEncode(ReadReceipt(conversationWith: peer, lastReadTs: 0).toJson()),
+      );
+    } on AtClientException catch (e) {
+      debugPrint('failed to mark unread: $e');
+    }
+  }
+
+  /// Delete the conversation for us: drop it from memory and best-effort
+  /// delete all of our own AtKeys that belong to it. For a group this also
+  /// removes our group metadata and leaves the group for us.
+  Future<void> deleteConversation(String convId) async {
+    if (groups.containsKey(convId)) {
+      await _deleteGroupConversation(convId);
+      return;
+    }
+    final peer = convId.toAtsign();
+    conversations.remove(peer);
+    archived.remove(peer);
+    notifyListeners();
+    unawaited(_saveArchived());
+
+    final peerNoAt = peer.withoutAt();
+    List<AtKey> keys;
+    try {
+      keys = await _atClient.getAtKeys(regex: appNamespace);
+    } on AtClientException catch (e) {
+      debugPrint('deleteConversation scan failed: $e');
+      return;
+    }
+    for (final key in keys) {
+      final name = key.key;
+      var remove = false;
+      if (key.sharedWith != null && key.sharedWith!.toAtsign() == peer) {
+        // msg./rct./read. we shared with this peer.
+        remove = true;
+      } else if (name == 'myread.$peerNoAt' || name == 'recvread.$peerNoAt') {
+        remove = true;
+      } else if (name.startsWith('recvmsg.') || name.startsWith('recvrct.')) {
+        // Id-based self copies — read to see if the counterparty is this peer.
+        try {
+          final value = (await _atClient.get(key)).value;
+          if (value != null) {
+            final m = (jsonDecode(value) as Map).cast<String, dynamic>();
+            final other = (m['from'] ?? m['by'])?.toString();
+            if (other != null && other.toAtsign() == peer) remove = true;
+          }
+        } catch (_) {}
+      }
+      if (remove) {
+        try {
+          await _atClient.delete(key);
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> _deleteGroupConversation(String groupId) async {
+    final group = groups.remove(groupId);
+    conversations.remove(groupId);
+    archived.remove(groupId);
+    notifyListeners();
+    unawaited(_saveArchived());
+    if (group == null) return;
+
+    List<AtKey> keys;
+    try {
+      keys = await _atClient.getAtKeys(regex: appNamespace);
+    } on AtClientException catch (e) {
+      debugPrint('group delete scan failed: $e');
+      return;
+    }
+    for (final key in keys) {
+      final name = key.key;
+      var remove = false;
+      if (name == 'grp.$groupId') {
+        remove = true; // our metadata copies (self + shared)
+      } else if (name.startsWith('msg.') ||
+          name.startsWith('recvmsg.') ||
+          name.startsWith('rct.') ||
+          name.startsWith('recvrct.')) {
+        try {
+          final value = (await _atClient.get(key)).value;
+          if (value != null) {
+            final m = (jsonDecode(value) as Map).cast<String, dynamic>();
+            if (m['groupId'] == groupId) remove = true;
+          }
+        } catch (_) {}
+      }
+      if (remove) {
+        try {
+          await _atClient.delete(key);
+        } catch (_) {}
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Groups
+  // ---------------------------------------------------------------------
+
+  ConversationState _groupConversation(Group g) =>
+      conversations.putIfAbsent(
+          g.id,
+          () => ConversationState(g.id,
+              isGroup: true, displayName: g.name, members: g.members));
+
+  /// Create a group and share its metadata with every other member.
+  Future<String> createGroup(String name, List<String> memberRaws) async {
+    final members = <String>{me, ...memberRaws.map((m) => m.toAtsign())}
+        .toList();
+    final group = Group(
+      id: _uuid.v4(),
+      name: name.trim().isEmpty ? 'Group' : name.trim(),
+      members: members,
+      createdBy: me,
+      ts: DateTime.now().millisecondsSinceEpoch,
+    );
+    groups[group.id] = group;
+    _groupConversation(group);
+    notifyListeners();
+
+    final json = jsonEncode(group.toJson());
+    // Self copy (syncs to my other devices).
+    try {
+      await _atClient.put(_selfKey('grp.${group.id}'), json);
+    } on AtClientException catch (e) {
+      debugPrint('failed to store own group copy: $e');
+    }
+    // Share with every other member.
+    for (final member in members) {
+      if (member == me) continue;
+      await _putAndNotify(_sharedKey('grp.${group.id}', member), json);
+    }
+    return group.id;
+  }
+
+  Future<void> _loadGroups() async {
+    List<AtKey> keys;
+    try {
+      keys = await _atClient.getAtKeys(regex: 'grp\\..*\\.$appNamespace');
+    } on AtClientException catch (e) {
+      debugPrint('group scan failed: $e');
+      return;
+    }
+    for (final key in keys) {
+      try {
+        final value = (await _atClient.get(key)).value;
+        if (value == null) continue;
+        _ingestGroup(Group.fromJson(jsonDecode(value)));
+      } catch (e) {
+        debugPrint('skipping unreadable group key $key: $e');
+      }
+    }
+  }
+
+  void _ingestGroup(Group g) {
+    groups[g.id] = g;
+    final conv = _groupConversation(g);
+    conv.displayName = g.name;
+    conv.members = g.members;
+  }
 
   // ---------------------------------------------------------------------
   // Outbound operations
@@ -130,6 +355,21 @@ class MessageService extends ChangeNotifier {
     ..key = keyName
     ..namespace = appNamespace
     ..sharedBy = me;
+
+  /// Recipients for a conversation id: the single peer for a 1:1, or every
+  /// other group member (fan-out) for a group.
+  List<String> _recipients(String convId) {
+    final g = groups[convId];
+    if (g != null) return g.members.where((m) => m != me).toList();
+    return [convId.toAtsign()];
+  }
+
+  ConversationState _convFor(String convId) {
+    final g = groups[convId];
+    return g != null
+        ? _groupConversation(g)
+        : _conversation(convId.toAtsign());
+  }
 
   /// Durable put + real-time notify. Returns true if the data is at least
   /// stored on our atServer (fire-and-forget delivery guaranteed).
@@ -160,36 +400,49 @@ class MessageService extends ChangeNotifier {
     return stored;
   }
 
-  Future<void> sendMessage(String peerRaw, String text,
+  Future<void> sendMessage(String convId, String text,
       {String? replyTo, String kind = 'text'}) async {
-    final peer = peerRaw.toAtsign();
+    final group = groups[convId];
+    final id = _uuid.v4();
     final msg = ChatMessage(
-      id: _uuid.v4(),
+      id: id,
       from: me,
-      to: peer,
+      to: group != null ? convId : convId.toAtsign(),
       text: text,
       ts: DateTime.now().millisecondsSinceEpoch,
       replyTo: replyTo,
       kind: kind,
+      groupId: group?.id,
     );
-    _conversation(peer).messagesById[msg.id] = msg;
-    statuses[msg.id] = DeliveryStatus.sending;
+    _convFor(convId).messagesById[id] = msg;
+    statuses[id] = DeliveryStatus.sending;
     notifyListeners();
 
-    final stored = await _putAndNotify(
-      _sharedKey('msg.${msg.id}', peer),
-      jsonEncode(msg.toJson()),
-      onDelivery: (delivered) {
-        // If not delivered we keep 'stored': the peer still gets it later
-        // via sync or the offline sweep.
-        if (delivered) statuses[msg.id] = DeliveryStatus.delivered;
-        notifyListeners();
-      },
-    );
-    if (statuses[msg.id] == DeliveryStatus.sending) {
-      statuses[msg.id] = stored ? DeliveryStatus.stored : DeliveryStatus.failed;
+    final json = jsonEncode(msg.toJson());
+    final recipients = _recipients(convId);
+    if (group != null) {
+      // Fan out to each member; use a simple stored/failed status for groups.
+      var anyStored = false;
+      for (final r in recipients) {
+        anyStored = await _putAndNotify(_sharedKey('msg.$id', r), json) ||
+            anyStored;
+      }
+      statuses[id] = anyStored ? DeliveryStatus.stored : DeliveryStatus.failed;
+      notifyListeners();
+    } else {
+      final stored = await _putAndNotify(
+        _sharedKey('msg.$id', recipients.first),
+        json,
+        onDelivery: (delivered) {
+          if (delivered) statuses[id] = DeliveryStatus.delivered;
+          notifyListeners();
+        },
+      );
+      if (statuses[id] == DeliveryStatus.sending) {
+        statuses[id] = stored ? DeliveryStatus.stored : DeliveryStatus.failed;
+      }
+      notifyListeners();
     }
-    notifyListeners();
   }
 
   DeliveryStatus statusOf(String msgId) =>
@@ -211,63 +464,55 @@ class MessageService extends ChangeNotifier {
   /// Sends [bytes] as an attachment. Returns null on success, or an
   /// error message (e.g. too large) to show the user.
   Future<String?> sendAttachment(
-      String peerRaw, Uint8List bytes, String fileName, String mime) async {
+      String convId, Uint8List bytes, String fileName, String mime) async {
     if (bytes.length > maxAttachmentBytes) {
       return 'File is too large (${formatSize(bytes.length)}). '
           'Attachments are limited to ${formatSize(maxAttachmentBytes)}.';
     }
-    final peer = peerRaw.toAtsign();
+    final group = groups[convId];
     final id = _uuid.v4();
     final kind = mime.startsWith('image/') ? 'image' : 'file';
     final msg = ChatMessage(
       id: id,
       from: me,
-      to: peer,
+      to: group != null ? convId : convId.toAtsign(),
       text: fileName,
       ts: DateTime.now().millisecondsSinceEpoch,
       kind: kind,
       fileName: fileName,
       mime: mime,
       fileSize: bytes.length,
+      groupId: group?.id,
     );
     _attachmentCache[id] = bytes;
-    _conversation(peer).messagesById[id] = msg;
+    _convFor(convId).messagesById[id] = msg;
     statuses[id] = DeliveryStatus.sending;
     notifyListeners();
 
-    // 1. Store the bytes on the cloud secondary so the peer can fetch them
-    //    the moment the metadata message wakes them.
-    var bytesStored = false;
-    try {
-      await _atClient.put(
-        _sharedKey('file.$id', peer),
-        base64Encode(bytes),
-        putRequestOptions: PutRequestOptions()..useRemoteAtServer = true,
-      );
-      bytesStored = true;
-    } on AtClientException catch (e) {
-      debugPrint('attachment bytes put failed: $e');
+    final b64 = base64Encode(bytes);
+    final metaJson = jsonEncode(msg.toJson());
+    var anyStored = false;
+    for (final r in _recipients(convId)) {
+      // 1. Upload the bytes to the cloud so the recipient can fetch them.
+      try {
+        await _atClient.put(
+          _sharedKey('file.$id', r),
+          b64,
+          putRequestOptions: PutRequestOptions()..useRemoteAtServer = true,
+        );
+      } on AtClientException catch (e) {
+        debugPrint('attachment bytes put failed for $r: $e');
+        continue;
+      }
+      // 2. Send the metadata message that drives the bubble.
+      anyStored = await _putAndNotify(_sharedKey('msg.$id', r), metaJson) ||
+          anyStored;
     }
-    if (!bytesStored) {
-      statuses[id] = DeliveryStatus.failed;
-      notifyListeners();
-      return 'Failed to upload the attachment. Check your connection.';
-    }
-
-    // 2. Store + notify the metadata message (drives the bubble + inbox).
-    final metaStored = await _putAndNotify(
-      _sharedKey('msg.$id', peer),
-      jsonEncode(msg.toJson()),
-      onDelivery: (delivered) {
-        if (delivered) statuses[id] = DeliveryStatus.delivered;
-        notifyListeners();
-      },
-    );
-    if (statuses[id] == DeliveryStatus.sending) {
-      statuses[id] = metaStored ? DeliveryStatus.stored : DeliveryStatus.failed;
-    }
+    statuses[id] = anyStored ? DeliveryStatus.stored : DeliveryStatus.failed;
     notifyListeners();
-    return null;
+    return anyStored
+        ? null
+        : 'Failed to upload the attachment. Check your connection.';
   }
 
   /// Lazily fetch (and cache) the bytes for an attachment message.
@@ -302,33 +547,31 @@ class MessageService extends ChangeNotifier {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
-  Future<void> _updateOwnMessage(ChatMessage updated) async {
-    final peer = updated.to;
-    _conversation(peer).messagesById[updated.id] = updated;
+  Future<void> _updateOwnMessage(String convId, ChatMessage updated) async {
+    _convFor(convId).messagesById[updated.id] = updated;
     notifyListeners();
-    await _putAndNotify(
-      _sharedKey('msg.${updated.id}', peer),
-      jsonEncode(updated.toJson()),
-    );
+    final json = jsonEncode(updated.toJson());
+    for (final r in _recipients(convId)) {
+      await _putAndNotify(_sharedKey('msg.${updated.id}', r), json);
+    }
   }
 
-  Future<void> editMessage(String peer, String msgId, String newText) async {
-    final msg = _conversation(peer.toAtsign()).messagesById[msgId];
+  Future<void> editMessage(String convId, String msgId, String newText) async {
+    final msg = _convFor(convId).messagesById[msgId];
     if (msg == null || msg.from != me || msg.deleted) return;
-    await _updateOwnMessage(msg.copyWith(text: newText, edited: true));
+    await _updateOwnMessage(convId, msg.copyWith(text: newText, edited: true));
   }
 
   /// Delete = tombstone: the message slot is preserved, content removed.
-  Future<void> deleteMessage(String peer, String msgId) async {
-    final msg = _conversation(peer.toAtsign()).messagesById[msgId];
+  Future<void> deleteMessage(String convId, String msgId) async {
+    final msg = _convFor(convId).messagesById[msgId];
     if (msg == null || msg.from != me) return;
-    await _updateOwnMessage(msg.copyWith(text: '', deleted: true));
+    await _updateOwnMessage(convId, msg.copyWith(text: '', deleted: true));
   }
 
-  Future<void> toggleReaction(String peerRaw, String msgId, String emoji) async {
-    final peer = peerRaw.toAtsign();
+  Future<void> toggleReaction(String convId, String msgId, String emoji) async {
     final emojiId = Reaction.emojiId(emoji);
-    final conv = _conversation(peer);
+    final conv = _convFor(convId);
     final existing = conv.reactions[msgId]?['$emojiId:$me'];
     final reaction = Reaction(
       msgId: msgId,
@@ -337,36 +580,38 @@ class MessageService extends ChangeNotifier {
       ts: DateTime.now().millisecondsSinceEpoch,
       removed: existing != null,
     );
-    _applyReaction(peer, reaction);
+    _applyReaction(conv.peer, reaction);
     notifyListeners();
-    await _putAndNotify(
-      _sharedKey('rct.$msgId.$emojiId', peer),
-      jsonEncode(reaction.toJson()),
-    );
+    final json = jsonEncode(reaction.toJson());
+    for (final r in _recipients(convId)) {
+      await _putAndNotify(_sharedKey('rct.$msgId.$emojiId', r), json);
+    }
   }
 
-  /// Mark the conversation with [peerRaw] read up to its latest inbound
-  /// message: persists my read position (self key, syncs across my devices)
-  /// and shares a read-receipt watermark with the peer.
-  Future<void> markRead(String peerRaw) async {
-    final peer = peerRaw.toAtsign();
-    final conv = _conversation(peer);
+  /// Mark a conversation read up to its latest inbound message. For 1:1 chats
+  /// this also shares a read-receipt watermark with the peer; groups just
+  /// update the local read position.
+  Future<void> markRead(String convId) async {
+    final conv = _convFor(convId);
     final latestInbound = conv.messagesById.values
         .where((m) => m.from != me)
         .fold<int>(0, (acc, m) => m.ts > acc ? m.ts : acc);
     if (latestInbound <= conv.myLastReadTs) return;
     conv.myLastReadTs = latestInbound;
     notifyListeners();
+    if (conv.isGroup) return; // no per-member receipts for groups
 
+    final peer = conv.peer.toAtsign();
+    final peerNoAt = peer.withoutAt();
     final receipt =
         ReadReceipt(conversationWith: peer, lastReadTs: latestInbound);
     final json = jsonEncode(receipt.toJson());
     try {
-      await _atClient.put(_selfKey('myread.${peer.withoutAt()}'), json);
+      await _atClient.put(_selfKey('myread.$peerNoAt'), json);
     } on AtClientException catch (e) {
       debugPrint('failed to persist read position: $e');
     }
-    await _putAndNotify(_sharedKey('read.${peer.withoutAt()}', peer), json);
+    await _putAndNotify(_sharedKey('read.$peerNoAt', peer), json);
   }
 
   Future<void> toggleFavorite(String msgId) async {
@@ -418,12 +663,16 @@ class MessageService extends ChangeNotifier {
           .split('.$appNamespace')
           .first;
 
-      if (name.startsWith('msg.')) {
+      if (name.startsWith('grp.')) {
+        _ingestGroup(Group.fromJson(jsonDecode(value)));
+        await _storeSelfCopy(name, value); // keep a synced self copy
+      } else if (name.startsWith('msg.')) {
         final msg = ChatMessage.fromJson(jsonDecode(value));
-        await _ingestMessage(from, msg, storeCopy: true);
+        // Route group messages to the group; 1:1 to the sender's conversation.
+        await _ingestMessage(msg.groupId ?? from, msg, storeCopy: true);
       } else if (name.startsWith('rct.')) {
         final reaction = Reaction.fromJson(jsonDecode(value));
-        _applyReaction(from, reaction);
+        _applyReaction(_reactionConvId(reaction, from), reaction);
         await _storeSelfCopy(
             'recvrct.${reaction.msgId}.${Reaction.emojiId(reaction.emoji)}.${from.withoutAt()}',
             value);
@@ -440,21 +689,48 @@ class MessageService extends ChangeNotifier {
     }
   }
 
-  Future<void> _ingestMessage(String peer, ChatMessage msg,
+  /// Route an inbound message into the right conversation. Group messages go
+  /// to the group (by msg.groupId); 1:1 messages go to [convIdHint] (the
+  /// sender). If a group message arrives before its metadata, a placeholder
+  /// group conversation is created.
+  ConversationState _conversationForMessage(String convIdHint, ChatMessage msg) {
+    if (msg.groupId != null) {
+      final g = groups[msg.groupId];
+      if (g != null) return _groupConversation(g);
+      return conversations.putIfAbsent(
+          msg.groupId!,
+          () => ConversationState(msg.groupId!,
+              isGroup: true, displayName: 'Group'));
+    }
+    return _conversation(convIdHint.toAtsign());
+  }
+
+  Future<void> _ingestMessage(String convIdHint, ChatMessage msg,
       {required bool storeCopy}) async {
-    final existing = _conversation(peer).messagesById[msg.id];
+    final conv = _conversationForMessage(convIdHint, msg);
+    final existing = conv.messagesById[msg.id];
     // Idempotent: overwrite (edits/tombstones re-use the id; last value wins).
-    _conversation(peer).messagesById[msg.id] = msg;
+    conv.messagesById[msg.id] = msg;
     if (storeCopy && (existing == null || existing.text != msg.text ||
         existing.deleted != msg.deleted || existing.edited != msg.edited)) {
       await _storeSelfCopy('recvmsg.${msg.id}', jsonEncode(msg.toJson()));
     }
   }
 
-  void _applyReaction(String peer, Reaction reaction) {
-    final byEmoji = _conversation(peer)
-        .reactions
-        .putIfAbsent(reaction.msgId, () => {});
+  /// Which conversation a reaction belongs to: the group/1:1 that holds the
+  /// target message, else the sender's 1:1.
+  String _reactionConvId(Reaction reaction, String from) {
+    for (final conv in conversations.values) {
+      if (conv.messagesById.containsKey(reaction.msgId)) return conv.peer;
+    }
+    return from;
+  }
+
+  void _applyReaction(String convId, Reaction reaction) {
+    final conv = groups.containsKey(convId)
+        ? _groupConversation(groups[convId]!)
+        : _conversation(convId.toAtsign());
+    final byEmoji = conv.reactions.putIfAbsent(reaction.msgId, () => {});
     final slot = '${Reaction.emojiId(reaction.emoji)}:${reaction.by}';
     if (reaction.removed) {
       byEmoji.remove(slot);
@@ -488,17 +764,22 @@ class MessageService extends ChangeNotifier {
     for (final key in keys) {
       final name = key.key;
       try {
-        if (name.startsWith('msg.') && key.sharedWith != null) {
+        if (name.startsWith('grp.')) {
+          // handled in _loadGroups
+          continue;
+        } else if (name.startsWith('msg.') && key.sharedWith != null) {
           // A message we sent.
           final value = (await _atClient.get(key)).value;
           if (value == null) continue;
           final msg = ChatMessage.fromJson(jsonDecode(value));
-          _conversation(key.sharedWith!.toAtsign()).messagesById[msg.id] = msg;
+          _conversationForMessage(key.sharedWith!.toAtsign(), msg)
+              .messagesById[msg.id] = msg;
         } else if (name.startsWith('recvmsg.')) {
           final value = (await _atClient.get(key)).value;
           if (value == null) continue;
           final msg = ChatMessage.fromJson(jsonDecode(value));
-          _conversation(msg.from.toAtsign()).messagesById[msg.id] = msg;
+          _conversationForMessage(msg.from.toAtsign(), msg)
+              .messagesById[msg.id] = msg;
         } else if (name.startsWith('rct.') && key.sharedWith != null) {
           final value = (await _atClient.get(key)).value;
           if (value == null) continue;
@@ -534,8 +815,9 @@ class MessageService extends ChangeNotifier {
   }
 
   Future<void> _sweepAllPeers() async {
-    for (final peer in conversations.keys.toList()) {
-      await sweepPeer(peer);
+    for (final conv in conversations.values.toList()) {
+      if (conv.isGroup) continue; // group messages arrive via notifications
+      await sweepPeer(conv.peer);
     }
     notifyListeners();
   }

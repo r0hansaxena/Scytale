@@ -37,6 +37,8 @@ class ChatMessage {
   final String? fileName;
   final String? mime;
   final int? fileSize;
+  // Set when this message belongs to a group; then `to` is the group id.
+  final String? groupId;
 
   const ChatMessage({
     required this.id,
@@ -51,6 +53,7 @@ class ChatMessage {
     this.fileName,
     this.mime,
     this.fileSize,
+    this.groupId,
   });
 
   bool get isCallEntry => kind == 'call';
@@ -70,6 +73,7 @@ class ChatMessage {
         fileName: fileName,
         mime: mime,
         fileSize: fileSize,
+        groupId: groupId,
       );
 
   Map<String, dynamic> toJson() => {
@@ -85,6 +89,7 @@ class ChatMessage {
         if (fileName != null) 'fileName': fileName,
         if (mime != null) 'mime': mime,
         if (fileSize != null) 'fileSize': fileSize,
+        if (groupId != null) 'groupId': groupId,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -100,6 +105,42 @@ class ChatMessage {
         fileName: json['fileName'] as String?,
         mime: json['mime'] as String?,
         fileSize: json['fileSize'] as int?,
+        groupId: json['groupId'] as String?,
+      );
+}
+
+/// A group chat. Stored as `grp.<id>.scytale` shared with every member (and a
+/// self copy for the creator). There is no group server — messages are
+/// fanned out to each member individually.
+class Group {
+  final String id;
+  final String name;
+  final List<String> members; // includes the creator
+  final String createdBy;
+  final int ts;
+
+  const Group({
+    required this.id,
+    required this.name,
+    required this.members,
+    required this.createdBy,
+    required this.ts,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'members': members,
+        'createdBy': createdBy,
+        'ts': ts,
+      };
+
+  factory Group.fromJson(Map<String, dynamic> json) => Group(
+        id: json['id'] as String,
+        name: json['name'] as String? ?? 'Group',
+        members: (json['members'] as List).map((e) => e.toString()).toList(),
+        createdBy: json['createdBy'] as String? ?? '',
+        ts: json['ts'] as int? ?? 0,
       );
 }
 
