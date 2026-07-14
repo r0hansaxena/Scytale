@@ -18,6 +18,7 @@ class ProfileService extends ChangeNotifier {
   AtClient get _atClient => AtClientManager.getInstance().atClient;
 
   final Map<String, Profile> _cache = {};
+  final Set<String> _attempted = {};
 
   AtKey _profileKey(String atSign) => AtKey()
     ..key = 'profile'
@@ -27,11 +28,27 @@ class ProfileService extends ChangeNotifier {
 
   Profile? cached(String atSign) => _cache[atSign];
 
+  /// Fire-and-forget: fetch a peer's profile once if we don't already have
+  /// it. Deduped, so it is safe to call from a widget build.
+  void ensure(String atSignRaw) {
+    final atSign = atSignRaw.toAtsign();
+    if (_cache.containsKey(atSign) || _attempted.contains(atSign)) return;
+    _attempted.add(atSign);
+    unawaited(fetch(atSign, refresh: true));
+  }
+
+  void reset() {
+    _cache.clear();
+    _attempted.clear();
+    notifyListeners();
+  }
+
   /// Publish (or update) our own public profile.
   Future<void> saveMyProfile(Profile profile) async {
     final me = _atClient.getCurrentAtSign()!.toAtsign();
     await _atClient.put(_profileKey(me), jsonEncode(profile.toJson()));
     _cache[me] = profile;
+    _attempted.add(me);
     notifyListeners();
   }
 
