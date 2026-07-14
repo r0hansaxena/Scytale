@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../core/constants.dart';
+import '../core/theme.dart';
 import 'welcome_screen.dart';
 
 /// Mandatory First-Run Atsign Gate.
@@ -26,6 +27,18 @@ class AtsignGateScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        actions: [
+          IconButton(
+            tooltip: 'Theme',
+            icon: const Icon(Icons.palette_outlined),
+            onPressed: () => showThemePicker(context),
+          ),
+        ],
+      ),
+      extendBodyBehindAppBar: true,
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 520),

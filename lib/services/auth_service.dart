@@ -21,9 +21,11 @@ import 'package:path_provider/path_provider.dart'
     show getApplicationSupportDirectory;
 
 import '../core/constants.dart';
+import '../core/theme.dart';
 import '../screens/inbox_screen.dart';
 import 'call_service.dart';
 import 'message_service.dart';
+import 'profile_service.dart';
 
 final AtSignLogger _logger = AtSignLogger(appNamespace);
 
@@ -268,6 +270,7 @@ Future<void> _setupAtClient(
 
   await MessageService.instance.start();
   await CallService.instance.start();
+  await ThemeController.instance.load();
 
   if (context.mounted) {
     Navigator.pushReplacement(
@@ -312,6 +315,8 @@ Future<void> logout(BuildContext context) async {
   await safeExecute('logout', () async {
     await CallService.instance.stop();
     await MessageService.instance.stop();
+    ProfileService.instance.reset();
+    ThemeController.instance.reset();
     AtClientManager.getInstance().reset();
   }, context: context);
 }

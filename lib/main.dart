@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'core/constants.dart';
 import 'core/navigation.dart';
+import 'core/theme.dart';
 import 'screens/atsign_gate_screen.dart';
 import 'screens/welcome_screen.dart';
 
@@ -18,20 +19,20 @@ class SecureMessagingApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: appTitle,
-      navigatorKey: navigatorKey,
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
-        useMaterial3: true,
+    return ListenableBuilder(
+      listenable: ThemeController.instance,
+      builder: (context, _) => MaterialApp(
+        title: appTitle,
+        navigatorKey: navigatorKey,
+        debugShowCheckedModeBanner: false,
+        // `theme` holds the user's selected theme (which may be dark); pin
+        // themeMode to light so MaterialApp always renders `theme` regardless
+        // of the OS setting. The auth flow re-forces light locally for the
+        // packaged Atsign dialogs (see WelcomeScreen).
+        theme: ThemeController.instance.data,
+        themeMode: ThemeMode.light,
+        home: const BootScreen(),
       ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-            seedColor: Colors.teal, brightness: Brightness.dark),
-        useMaterial3: true,
-      ),
-      home: const BootScreen(),
     );
   }
 }
